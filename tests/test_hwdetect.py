@@ -5,6 +5,7 @@ debugfs/sysfs tree, which is what CI and the dev loop actually need.
 """
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,30 @@ from awtop import sysinfo  # noqa: E402
 
 
 class TestCoreLoadingParser:
-    """The viplite `core_loading` format varies between driver generations."""
+    """The viplite `core_loading` format varies between driver generations.
+
+    The T527 fixture is the format read off a real Orange Pi 4A:
+    `NPU Loading -----> Core0:  0%`.
+    """
+
+    def test_real_t527_output(self):
+        assert hwdetect._parse_core_loading(
+            "NPU Loading -----> Core0:  0%\n"
+        ) == [0]
+
+    def test_real_t527_under_load(self):
+        assert hwdetect._parse_core_loading(
+            "NPU Loading -----> Core0: 87%\n"
+        ) == [87]
+
+    def test_real_t527_without_trailing_newline(self):
+        assert hwdetect._parse_core_loading("NPU Loading -----> Core0:  0%") == [0]
+
+    def test_real_t527_banner_does_not_leak_into_result(self):
+        # "Loading" must not be mistaken for a core reading, and the trailing
+        # arrow must not shift the percentage that follows it.
+        loads = hwdetect._parse_core_loading("NPU Loading -----> Core0: 42%")
+        assert loads == [42]
 
     @pytest.mark.parametrize(
         "text,expected",
@@ -41,6 +65,22 @@ class TestCoreLoadingParser:
 
     def test_values_are_clamped(self):
         assert hwdetect._parse_core_loading("core 0: 150%") == [100]
+
+
+class TestNpuLoadDistinguishesIdleFromUnreadable:
+    """A real 0% must not be reported the same way as a failed read."""
+
+    def test_idle_npu_returns_zero_not_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            hwdetect,
+            "_read",
+            lambda p: "NPU Loading -----> Core0:  0%\n",
+        )
+        assert hwdetect.get_npu_load() == [0]
+
+    def test_unreadable_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(hwdetect, "_read", lambda p: None)
+        assert hwdetect.get_npu_load() == []
 
 
 class TestFrequencyUnits:
@@ -127,53 +167,118 @@ class TestDevfreqLoad:
         assert hwdetect.get_devfreq_info("/x")["load"] is None
 
 
-class TestTransStat:
-    """GPU/DDR busy percentage comes from the trans_stat histogram."""
+class TestGpuLoadSampling:
+    """GPU utilisation is sampled from cur_freq, not read from trans_stat.
 
-    def test_top_frequency_residency(self, monkeypatch):
-        # Columns are the "to" frequencies from the header; the last column is
-        # the top frequency, so 900ms of the 1000ms total landed there.
+    `trans_stat` is cumulative since boot and only records *transitions*, so it
+    reports a lifetime average that never moves and cannot express current
+    activity. Sampling the clock over a window is the only signal available on
+    sunxi, whose GPU node exposes no `load` or `busy_time` attribute.
+    """
+
+    def _fake_freqs(self, monkeypatch, samples, min_freq=150_000_000):
+        seq = list(samples)
+        monkeypatch.setattr(hwdetect.time, "sleep", lambda s: None)
+        monkeypatch.setattr(
+            hwdetect,
+            "_read_int",
+            lambda p: min_freq if p.endswith("min_freq") else seq.pop(0),
+        )
+
+    def test_parked_at_minimum(self, monkeypatch):
+        self._fake_freqs(monkeypatch, [150_000_000] * 4)
+        assert hwdetect._sample_devfreq_load("/x", samples=4, interval=0) == 0.0
+
+    def test_full_boost(self, monkeypatch):
+        self._fake_freqs(monkeypatch, [696_000_000] * 4)
+        assert hwdetect._sample_devfreq_load("/x", samples=4, interval=0) == 100.0
+
+    def test_partial_load_is_proportional(self, monkeypatch):
+        # Two of four samples busy.
+        self._fake_freqs(monkeypatch, [696_000_000, 150_000_000,
+                                       696_000_000, 150_000_000])
+        assert hwdetect._sample_devfreq_load("/x", samples=4, interval=0) == 50.0
+
+    def test_missing_min_freq(self, monkeypatch):
+        monkeypatch.setattr(hwdetect, "_read_int", lambda p: None)
+        assert hwdetect._sample_devfreq_load("/x", samples=2, interval=0) is None
+
+    def test_no_readable_samples(self, monkeypatch):
+        monkeypatch.setattr(hwdetect.time, "sleep", lambda s: None)
+        monkeypatch.setattr(
+            hwdetect,
+            "_read_int",
+            lambda p: 150_000_000 if p.endswith("min_freq") else None,
+        )
+        assert hwdetect._sample_devfreq_load("/x", samples=3, interval=0) is None
+
+
+class TestGpuUsageCache:
+    """Sampling is cached so the per-refresh cost stays bounded."""
+
+    def test_repeat_call_is_cached(self, monkeypatch):
+        calls = []
+
+        def fake_sample(path, **kw):
+            calls.append(path)
+            return 42.0
+
+        monkeypatch.setattr(hwdetect, "get_gpu_path", lambda: "/x")
+        monkeypatch.setattr(hwdetect, "_sample_devfreq_load", fake_sample)
+        monkeypatch.setattr(hwdetect, "_GPU_USAGE_CACHE", [None, None])
+
+        assert hwdetect.get_gpu_usage() == 42.0
+        assert hwdetect.get_gpu_usage() == 42.0
+        assert len(calls) == 1
+
+    def test_cache_expires(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(hwdetect, "get_gpu_path", lambda: "/x")
+        monkeypatch.setattr(
+            hwdetect,
+            "_sample_devfreq_load",
+            lambda path, **kw: calls.append(1) or 42.0,
+        )
+        monkeypatch.setattr(hwdetect, "_GPU_USAGE_CACHE", [None, None])
+        monkeypatch.setattr(hwdetect, "_GPU_USAGE_TTL", 0.0)
+
+        hwdetect.get_gpu_usage()
+        time.sleep(0.001)
+        hwdetect.get_gpu_usage()
+        assert len(calls) == 2
+
+    def test_no_gpu_node(self, monkeypatch):
+        monkeypatch.setattr(hwdetect, "get_gpu_path", lambda: None)
+        monkeypatch.setattr(hwdetect, "_GPU_USAGE_CACHE", [None, None])
+        assert hwdetect.get_gpu_usage() is None
+
+
+class TestParseTransStat:
+    """The trans_stat matrix is still parsed for the DDR panel's diagnostics."""
+
+    def test_row_totals(self, monkeypatch):
         raw = (
             "     From  :   To\n"
-            "           : 150000000 696000000   time(ms)\n"
-            "*150000000:         0       900     900\n"
-            " 696000000:       100         0     100\n"
-            "Total transition : 2"
+            "           : 150000000 200000000 300000000   time(ms)\n"
+            "*150000000:         0         0         0     100\n"
+            " 200000000:         5         0         0     200\n"
+            " 300000000:         0         7         0     300\n"
+            "Total transition : 3"
         )
         monkeypatch.setattr(hwdetect, "_read", lambda p: raw)
-        assert hwdetect._devfreq_busy_pct("/x") == pytest.approx(90.0)
-
-    def test_all_idle_at_low_frequency(self, monkeypatch):
-        raw = (
-            "     From  :   To\n"
-            "           : 150000000 696000000   time(ms)\n"
-            "*150000000:       900         0     900\n"
-            " 696000000:         0         0       0\n"
-            "Total transition : 2"
-        )
-        monkeypatch.setattr(hwdetect, "_read", lambda p: raw)
-        assert hwdetect._devfreq_busy_pct("/x") == 0.0
-
-    def test_malformed_header_degrades(self, monkeypatch):
-        # The sunxi DMC node prints its header without a separating space, which
-        # fuses two frequencies into one bogus value. That must not raise.
-        raw = (
-            "     From  :   To\n"
-            "           : 150000000 480000000 8000000001200000000   time(ms)\n"
-            "*1200000000:         0         0         0         0  11834728\n"
-            "Total transition : 0"
-        )
-        monkeypatch.setattr(hwdetect, "_read", lambda p: raw)
-        assert hwdetect._devfreq_busy_pct("/x") in (None, 0.0)
-
-    def test_no_current_frequency_marker(self, monkeypatch):
-        raw = "     From  :   To\n 150000000:  0  0  100\n"
-        monkeypatch.setattr(hwdetect, "_read", lambda p: raw)
-        assert hwdetect._devfreq_busy_pct("/x") is None
+        assert hwdetect._parse_trans_stat("/x") == {
+            150_000_000: 0,
+            200_000_000: 5,
+            300_000_000: 7,
+        }
 
     def test_unreadable(self, monkeypatch):
         monkeypatch.setattr(hwdetect, "_read", lambda p: None)
-        assert hwdetect._devfreq_busy_pct("/x") is None
+        assert hwdetect._parse_trans_stat("/x") == {}
+
+    def test_headerless(self, monkeypatch):
+        monkeypatch.setattr(hwdetect, "_read", lambda p: "nothing here\n")
+        assert hwdetect._parse_trans_stat("/x") == {}
 
 
 class TestZram:

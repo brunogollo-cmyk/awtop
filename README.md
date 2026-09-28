@@ -25,7 +25,7 @@ since every peripheral is discovered at runtime rather than hardcoded.
 | --- | --- | --- |
 | **CPU** | `psutil` + `cpufreq` | One bar per core. The T527 has 8 cores but only **two** policies (0–3 little, 4–7 big), so each core reports its cluster's clock. |
 | **Memory** | `psutil` | RAM / swap / ZRAM, with a detail grid. |
-| **GPU** | devfreq `trans_stat` | Busy time at the top clock, clock speed and governor. |
+| **GPU** | devfreq `cur_freq` (sampled) | Share of samples not parked at the minimum clock, plus speed and governor. |
 | **NPU** | `/sys/kernel/debug/viplite/core_loading` | Per-core load, chip generation and VIPLite version. |
 | **DDR** | devfreq | Memory-controller clock and governor. |
 | **I/O** | `psutil` | Disk and per-NIC throughput. |
@@ -128,17 +128,33 @@ the live sysfs/debugfs tree, including the `trans_stat` matrix format and the
 in `hwdetect._SOC_NAMES`.
 
 **NPU.** The T527's Vivante NPU has no devfreq node and no sysfs load
-attribute. The version, chip generation (`VF3`), clock (696 MHz) and carved-out
-video memory are recovered from the VIPLite banner in the kernel log, and the
-live load comes from `debugfs/viplite/core_loading`. The parser accepts the
-several layouts used across VIPLite driver generations and skips summary lines
-so a single-core NPU still reports one value.
+attribute. `debugfs/viplite/core_loading` reports it as a single line:
+
+```
+NPU Loading -----> Core0:  0%
+```
+
+The version, chip generation (`VF3`), clock (696 MHz) and carved-out video
+memory are recovered from the VIPLite banner in the kernel log. The parser
+also accepts the multi-core and alternate layouts used by other VIPLite driver
+generations, and skips summary lines so a single-core NPU still reports one
+value. A readable-but-idle NPU returns `0%`, which is drawn as an empty bar —
+distinct from the "unavailable" state shown when the file cannot be read
+without root.
 
 **GPU load.** Mali on sunxi exposes no `busy_time`/`idle_time` file like the
-Mali driver on Rockchip does, and the devfreq node has no `load` attribute.
-Utilisation is therefore derived from `trans_stat` — the fraction of time spent
-at the highest available clock. This is an approximation, not a hardware
-counter, and it reads 0% on a GPU that is busy but throttled low.
+Mali driver on Rockchip does, and the devfreq node has no `load` attribute. The
+`trans_stat` matrix is *not* usable for this: it is cumulative since boot and
+records only frequency *transitions*, so it yields a lifetime average that
+barely moves and reports zero while the GPU is pinned at a steady clock.
+
+Utilisation is therefore **sampled** from `cur_freq` over a short window, and
+reported as the share of samples that were not parked at the minimum frequency.
+Under the `simple_ondemand` governor the clock rises with demand, so this
+tracks real activity: an idle desktop reads 0% / 150 MHz, and a busy one reads
+100% / 696 MHz. It is an estimate, not a hardware counter, so a GPU that is busy
+while throttled low will read lower than it really is. Results are cached for a
+second so the per-refresh sampling cost stays bounded.
 
 **DDR.** The DMC runs under the `performance` governor and never leaves its
 maximum clock, so no utilisation bar is drawn; it would always read 100%.

@@ -98,7 +98,12 @@ def build_mem_panel():
 
 
 def build_gpu_panel():
-    """GPU utilisation, frequency and governor from the devfreq node."""
+    """GPU activity, frequency and governor.
+
+    The bar is labelled "Active" rather than a bare percentage because on sunxi
+    it is a sampling-derived estimate, not a hardware busy counter: the Mali
+    node exposes no `load` and no `busy_time`/`idle_time` pair.
+    """
     usage = hwdetect.get_gpu_usage()
     freq = hwdetect.get_gpu_frequency()
     path = hwdetect.get_gpu_path()
@@ -115,7 +120,7 @@ def build_gpu_panel():
 
     freq_str = f" {freq} MHz" if freq is not None else ""
     progress = Progress(
-        TextColumn("GPU"),
+        TextColumn("Active"),
         BarColumn(bar_width=None),
         TextColumn(f"{usage:.0f}%{freq_str}"),
         expand=True,
@@ -142,8 +147,12 @@ def build_npu_panel():
     freq = hwdetect.get_npu_frequency()
 
     if not loads:
+        # An empty list means core_loading could not be read at all (it lives in
+        # debugfs, so it needs root). A real reading of 0% arrives as [0] and
+        # is drawn as a normal empty bar below, not as an error.
         return Panel(
-            f"NPU idle (no core_loading)\n[dim]{chip or ''} VIPLite {driver}[/dim]",
+            f"core_loading unavailable\n[dim]{chip or ''} VIPLite {driver}\n"
+            f"run as root to enable[/dim]",
             title="NPU",
             box=box.ROUNDED,
             border_style="green",

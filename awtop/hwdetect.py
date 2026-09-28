@@ -27,6 +27,7 @@ import glob
 import os
 import re
 import subprocess
+import time
 
 DEVFREQ_ROOT = "/sys/class/devfreq"
 THERMAL_ROOT = "/sys/class/thermal"
@@ -307,51 +308,72 @@ def _devfreq_load(path, cur, min_f):
     return max(0.0, min(100.0, span * 100.0))
 
 
-def _devfreq_busy_pct(path):
-    """Percentage of time the device spent running at its top frequency.
+def _parse_trans_stat(path):
+    """Parse the devfreq `trans_stat` matrix into {frequency: total_ms}.
 
-    `trans_stat` is a transition matrix: every row is a source frequency
-    followed by one time value per target frequency, and the rows are ordered
-    by ascending frequency. Summing the column of the highest frequency gives
-    the time actually spent at the top clock, which is the closest thing to a
-    busy signal on drivers that do not export `load`.
-
-    The column list is derived from the row labels rather than the header
-    because some sunxi nodes (the DMC controller) print the header frequencies
-    without separators, fusing two of them into one unusable token.
+    Every row is a source frequency followed by one time value per target
+    frequency plus a trailing row total. The column list is derived from the
+    row labels rather than the header, because some sunxi nodes (the DMC
+    controller) print the header frequencies without separators, fusing two
+    of them into one unusable token.
     """
     raw = _read(f"{path}/trans_stat")
     if not raw:
-        return None
+        return {}
 
     rows = []
     for line in raw.splitlines():
         m = re.match(r"^\s*\*?\s*(\d+):(.*)$", line)
-        if not m:
-            continue
-        rows.append((int(m.group(1)), m.group(2)))
+        if m:
+            rows.append((int(m.group(1)), m.group(2)))
     if not rows:
-        return None
+        return {}
 
-    freqs = [freq for freq, _ in rows]
-    top = max(freqs)
-    top_col = freqs.index(top)
-
-    busy = total = 0
-    for _, body in rows:
+    ncols = len(rows)
+    totals = {}
+    for freq, body in rows:
         values = [int(v) for v in body.split()]
-        # Trailing totals (time, transitions) are not per-frequency buckets.
-        buckets = values[: len(freqs)]
-        if len(buckets) <= top_col:
-            continue
-        busy += buckets[top_col]
-        total += sum(buckets)
-    if not total:
+        # The last value is the row total; the ones before it are per-target.
+        totals[freq] = sum(values[:ncols]) if len(values) > ncols else 0
+    return totals
+
+
+def _sample_devfreq_load(path, samples=8, interval=0.02):
+    """GPU utilisation by sampling `cur_freq` over a short window.
+
+    The sunxi GPU node exposes no `load` attribute and no
+    `busy_time`/`idle_time` pair, so the clock itself is the only signal. This
+    samples it repeatedly and reports the share of samples that were not parked
+    at the minimum frequency, which tracks real activity closely enough to see
+    a busy GPU (the `simple_ondemand` governor raises the clock on demand).
+
+    Sampling is deliberately short: the dashboard refreshes every 1.5s, so
+    anything longer would itself become the visible latency.
+    """
+    min_freq = _read_int(f"{path}/min_freq")
+    if min_freq is None:
         return None
-    return busy / total * 100.0
+
+    active = 0
+    seen = 0
+    for _ in range(samples):
+        cur = _read_int(f"{path}/cur_freq")
+        if cur is not None:
+            seen += 1
+            if cur > min_freq:
+                active += 1
+        if interval:
+            time.sleep(interval)
+    if not seen:
+        return None
+    return active / seen * 100.0
 
 
 # --- GPU ------------------------------------------------------------------
+
+#: (monotonic timestamp, usage) for the last GPU sampling, with its TTL.
+_GPU_USAGE_CACHE = [None, None]
+_GPU_USAGE_TTL = 1.0
 
 
 def get_gpu_path():
@@ -404,18 +426,25 @@ def get_gpu_renderer():
 
 
 def get_gpu_usage():
-    """GPU busy percentage, or None when the driver exposes no such metric.
+    """GPU utilisation percentage, or None when it cannot be determined.
 
-    `trans_stat` is preferred because it is cumulative and time-weighted, so it
-    does not flicker between refreshes the way a single frequency sample does.
+    The result is cached for a short window: sampling costs a few hundred
+    milliseconds, and both the CPU and the process table are refreshed on the
+    same 1.5s cycle, so re-sampling per panel would multiply the cost for no
+    extra resolution.
     """
+    now = time.monotonic()
+    cached = _GPU_USAGE_CACHE
+    if cached[0] is not None and now - cached[0] < _GPU_USAGE_TTL:
+        return cached[1]
+
     path = get_gpu_path()
-    if not path:
-        return None
-    busy = _devfreq_busy_pct(path)
-    if busy is not None:
-        return busy
-    return get_devfreq_info(path)["load"]
+    usage = None
+    if path:
+        usage = _sample_devfreq_load(path)
+    _GPU_USAGE_CACHE[0] = now
+    _GPU_USAGE_CACHE[1] = usage
+    return usage
 
 
 def get_gpu_frequency():
@@ -475,9 +504,14 @@ def get_npu_chip():
 def get_npu_load():
     """Per-core NPU utilisation.
 
-    Prefers `core_loading` in debugfs, which reports one line per core. Falls
-    back to the older `load` node when present. Returns [] when neither is
-    readable, which makes the caller hide the NPU panel.
+    `core_loading` in debugfs is the authoritative source; on the T527 it prints
+    a single line such as `NPU Loading -----> Core0:  0%`. Returns a list with
+    one percentage per core, or [] when the file is unreadable, which is what
+    tells the caller to show the "unavailable" state instead of a fake 0%.
+
+    An empty core list is never returned for a readable file: a genuinely idle
+    NPU returns [0], which is a real reading and must not be confused with
+    "cannot read".
     """
     raw = _read(f"{VIPLITE_DEBUG}/core_loading")
     if raw:
