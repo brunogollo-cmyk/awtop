@@ -11,7 +11,8 @@ set -e
 
 PREFIX="${PREFIX:-/usr/local}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-LIB_DIR="$PREFIX/lib/awtop"
+LIB_ROOT="$PREFIX/lib"
+PKG_DIR="$LIB_ROOT/awtop"
 BIN="$PREFIX/bin/awtop"
 
 usage() {
@@ -31,9 +32,9 @@ fi
 # --- uninstall ------------------------------------------------------------
 
 if [ "${1:-}" = "--uninstall" ]; then
-    echo "Removing $BIN and $LIB_DIR..."
+    echo "Removing $BIN and $PKG_DIR..."
     rm -f "$BIN"
-    rm -rf "$LIB_DIR"
+    rm -rf "$PKG_DIR"
     echo "Done."
     exit 0
 fi
@@ -55,11 +56,11 @@ check_deps
 
 # --- install --------------------------------------------------------------
 
-echo "Installing package to $LIB_DIR..."
-mkdir -p "$LIB_DIR"
-rm -rf "$LIB_DIR/awtop"
-cp -r "$SRC_DIR/awtop" "$LIB_DIR/awtop"
-find "$LIB_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+echo "Installing package to $PKG_DIR..."
+mkdir -p "$LIB_ROOT"
+rm -rf "$PKG_DIR"
+cp -r "$SRC_DIR/awtop" "$PKG_DIR"
+find "$PKG_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
 echo "Installing launcher to $BIN..."
 mkdir -p "$PREFIX/bin"
@@ -67,7 +68,7 @@ cat > "$BIN" <<LAUNCHER
 #!/usr/bin/env python3
 import sys
 
-sys.path.insert(0, "$LIB_DIR")
+sys.path.insert(0, "$LIB_ROOT")
 
 from awtop.app import main
 
